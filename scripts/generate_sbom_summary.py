@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 import requests
 
 MAX_COMPONENTS_IN_PROMPT = 60
+MAX_SNIPPETS_IN_PROMPT = 40
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 
@@ -73,6 +74,36 @@ def load_scan_results(path: str) -> dict:
         return json.load(f)
 
 
+def _extract_license_names(raw_licenses, license_counter=None):
+    names = []
+    for lic in raw_licenses or []:
+        name = lic.get("name") if isinstance(lic, dict) else str(lic)
+        if name:
+            names.append(name)
+            if license_counter is not None:
+                license_counter[name] += 1
+    return names
+
+
+def _extract_vulnerabilities(raw_vulns):
+    """
+    Defensive extraction: SCANOSS only returns vulnerability data when the
+    scan is run against an API tier / integration that provides it (e.g.
+    Dependency Track). Most default scans will have no 'vulnerabilities'
+    key at all - that's different from "zero vulnerabilities found".
+    """
+    out = []
+    for v in raw_vulns or []:
+        if not isinstance(v, dict):
+            continue
+        out.append({
+            "id": v.get("id") or v.get("CVE") or v.get("cve") or "UNKNOWN",
+            "severity": v.get("severity", "unknown"),
+            "source": v.get("source", ""),
+        })
+    return out
+
+
 def summarize(results: dict) -> dict:
     """
     SCANOSS raw results are keyed by scanned file path, each holding a list
@@ -81,73 +112,121 @@ def summarize(results: dict) -> dict:
     """
     total_files = len(results)
     matched_files = 0
-    components = {}  # purl -> {vendor, component, version, license_names:set}
-    license_counter = Counter()
+    components = {}
     dependency_components = {}
+    license_counter = Counter()
+    snippet_matches = []
+    vulnerability_field_seen = False
+    all_vulnerabilities = {}  # vuln id -> {id, severity, source, affected: set}
 
     for filepath, matches in results.items():
         if not matches:
             continue
         for match in matches:
-            match_id = match.get("id", "none")
-            if match_id and match_id != "none":
+            match_type = match.get("id", "none")  # "file" | "snippet" | "none"
+            if match_type and match_type != "none":
                 matched_files += 1
 
             purls = match.get("purl") or []
+            purl = purls[0] if purls else None
             vendor = match.get("vendor", "")
             component_name = match.get("component", "")
             version = match.get("version", "")
-            licenses = match.get("licenses") or match.get("license") or []
+            license_names = _extract_license_names(
+                match.get("licenses") or match.get("license"), license_counter
+            )
 
-            license_names = []
-            for lic in licenses:
-                if isinstance(lic, dict):
-                    name = lic.get("name")
-                else:
-                    name = str(lic)
-                if name:
-                    license_names.append(name)
-                    license_counter[name] += 1
+            if "vulnerabilities" in match:
+                vulnerability_field_seen = True
+            match_vulns = _extract_vulnerabilities(match.get("vulnerabilities"))
 
-            key = purls[0] if purls else f"{vendor}/{component_name}@{version}"
-            if key and key not in components:
+            key = purl or f"{vendor}/{component_name}@{version}"
+
+            if key and match_type != "none" and (purl or component_name or vendor):
                 risk_levels = [classify_license(n) for n in license_names] or ["unknown"]
-                components[key] = {
-                    "purl": purls[0] if purls else None,
+                entry = components.setdefault(key, {
+                    "purl": purl,
                     "vendor": vendor,
                     "component": component_name,
                     "version": version,
-                    "licenses": sorted(set(license_names)),
-                    "license_risk": worst_risk(risk_levels),
-                }
+                    "licenses": set(),
+                    "license_risk": "unknown",
+                    "vulnerabilities": {},
+                    "match_types": set(),
+                    "files_matched": 0,
+                })
+                entry["licenses"].update(license_names)
+                entry["license_risk"] = worst_risk(
+                    [entry["license_risk"]] + risk_levels
+                )
+                entry["match_types"].add(match_type)
+                entry["files_matched"] += 1
+                for v in match_vulns:
+                    entry["vulnerabilities"][v["id"]] = v
+                    rec = all_vulnerabilities.setdefault(v["id"], {**v, "affected": set()})
+                    rec["affected"].add(component_name or purl or key)
+
+            # Snippet-level detail (file/line-range matches worth surfacing individually)
+            if match_type == "snippet":
+                snippet_matches.append({
+                    "file": filepath,
+                    "component": component_name,
+                    "version": version,
+                    "purl": purl,
+                    "matched_pct": match.get("matched", ""),
+                    "target_lines": match.get("lines", ""),
+                    "oss_lines": match.get("oss_lines", ""),
+                    "oss_url": match.get("url", ""),
+                })
 
             # Dependency-scanner entries (when dependencies.enabled: true)
             for dep in match.get("dependencies", []) or []:
                 dep_purl = dep.get("purl", "")
                 dep_version = dep.get("version", "")
-                dep_licenses = dep.get("licenses") or []
-                dep_license_names = [
-                    lic.get("name") if isinstance(lic, dict) else str(lic)
-                    for lic in dep_licenses
-                    if lic
-                ]
+                dep_license_names = _extract_license_names(dep.get("licenses"), license_counter)
+                if "vulnerabilities" in dep:
+                    vulnerability_field_seen = True
+                dep_vulns = _extract_vulnerabilities(dep.get("vulnerabilities"))
+
                 dkey = dep_purl or f"{dep.get('component','')}@{dep_version}"
-                if dkey and dkey not in dependency_components:
+                if dkey:
                     dep_risk_levels = [classify_license(n) for n in dep_license_names] or ["unknown"]
-                    dependency_components[dkey] = {
+                    dep_entry = dependency_components.setdefault(dkey, {
                         "purl": dep_purl or None,
                         "component": dep.get("component", ""),
                         "version": dep_version,
-                        "licenses": sorted(set(dep_license_names)),
-                        "license_risk": worst_risk(dep_risk_levels),
-                    }
+                        "licenses": set(),
+                        "license_risk": "unknown",
+                        "vulnerabilities": {},
+                    })
+                    dep_entry["licenses"].update(dep_license_names)
+                    dep_entry["license_risk"] = worst_risk(
+                        [dep_entry["license_risk"]] + dep_risk_levels
+                    )
+                    for v in dep_vulns:
+                        dep_entry["vulnerabilities"][v["id"]] = v
+                        rec = all_vulnerabilities.setdefault(v["id"], {**v, "affected": set()})
+                        rec["affected"].add(dep.get("component", "") or dep_purl or dkey)
 
-    all_items = list(components.values()) + list(dependency_components.values())
+    def finalize(entry):
+        return {
+            **{k: v for k, v in entry.items() if k not in ("licenses", "match_types", "vulnerabilities")},
+            "licenses": sorted(entry["licenses"]),
+            "match_types": sorted(entry.get("match_types", [])) if "match_types" in entry else None,
+            "vulnerabilities": list(entry["vulnerabilities"].values()),
+            "vulnerability_count": len(entry["vulnerabilities"]),
+        }
+
+    finalized_components = {k: finalize(v) for k, v in components.items()}
+    finalized_dependencies = {k: finalize(v) for k, v in dependency_components.items()}
+
+    all_items = list(finalized_components.values()) + list(finalized_dependencies.values())
     risk_counts = Counter(item["license_risk"] for item in all_items)
     flagged_copyleft = [
         {
             "component": item["component"] or item.get("purl"),
             "version": item["version"],
+            "purl": item.get("purl"),
             "licenses": item["licenses"],
             "license_risk": item["license_risk"],
         }
@@ -155,22 +234,48 @@ def summarize(results: dict) -> dict:
         if item["license_risk"] in ("strong_copyleft", "weak_copyleft")
     ]
 
+    vulnerable_components = [
+        {
+            "component": item["component"] or item.get("purl"),
+            "version": item["version"],
+            "purl": item.get("purl"),
+            "vulnerabilities": item["vulnerabilities"],
+        }
+        for item in all_items
+        if item["vulnerability_count"] > 0
+    ]
+
+    severity_counts = Counter(v.get("severity", "unknown") for v in all_vulnerabilities.values())
+
+    # Sort snippets by lowest match percentage first (most interesting to review),
+    # falling back to original order when percentage isn't parseable.
+    def _pct(sm):
+        try:
+            return float(str(sm.get("matched_pct", "")).rstrip("%"))
+        except ValueError:
+            return 100.0
+
+    snippet_matches.sort(key=_pct)
+
     return {
         "total_files_scanned": total_files,
         "matched_files": matched_files,
         "unmatched_files": total_files - matched_files,
-        "unique_components_count": len(components),
-        "unique_dependency_components_count": len(dependency_components),
+        "unique_components_count": len(finalized_components),
+        "unique_dependency_components_count": len(finalized_dependencies),
         "license_breakdown": license_counter.most_common(),
         "risk_counts": dict(risk_counts),
         "flagged_copyleft_components": flagged_copyleft,
-        "components": list(components.values())[:MAX_COMPONENTS_IN_PROMPT],
-        "dependency_components": list(dependency_components.values())[
-            :MAX_COMPONENTS_IN_PROMPT
-        ],
-        "components_truncated": len(components) > MAX_COMPONENTS_IN_PROMPT,
-        "dependency_components_truncated": len(dependency_components)
-        > MAX_COMPONENTS_IN_PROMPT,
+        "vulnerability_data_present": vulnerability_field_seen,
+        "vulnerability_severity_counts": dict(severity_counts),
+        "vulnerable_components": vulnerable_components[:MAX_COMPONENTS_IN_PROMPT],
+        "components": list(finalized_components.values())[:MAX_COMPONENTS_IN_PROMPT],
+        "dependency_components": list(finalized_dependencies.values())[:MAX_COMPONENTS_IN_PROMPT],
+        "components_truncated": len(finalized_components) > MAX_COMPONENTS_IN_PROMPT,
+        "dependency_components_truncated": len(finalized_dependencies) > MAX_COMPONENTS_IN_PROMPT,
+        "snippet_matches": snippet_matches[:MAX_SNIPPETS_IN_PROMPT],
+        "snippet_matches_total": len(snippet_matches),
+        "snippet_matches_truncated": len(snippet_matches) > MAX_SNIPPETS_IN_PROMPT,
     }
 
 
@@ -193,10 +298,21 @@ def call_claude(summary: dict, repo_name: str, repo_ref: str, commit_sha: str) -
         "condensed, pre-aggregated JSON summary of a SCANOSS SCA/SBOM scan. "
         "The JSON already contains a deterministic license risk classification "
         "per component (license_risk: strong_copyleft | weak_copyleft | permissive | "
-        "unknown) and a pre-filtered list of copyleft-flagged components "
-        "(flagged_copyleft_components). Do NOT reclassify or second-guess these "
-        "risk labels yourself, and do not invent components, licenses, or "
-        "numbers that are not present in the JSON.\n\n"
+        "unknown), a pre-filtered list of copyleft-flagged components "
+        "(flagged_copyleft_components), pre-extracted vulnerability records per "
+        "component (vulnerable_components, vulnerability_severity_counts), and "
+        "pre-extracted snippet-level match detail (snippet_matches: file, "
+        "component, version, purl, matched_pct, target_lines, oss_lines, oss_url). "
+        "Do NOT reclassify or second-guess the risk labels, do NOT invent "
+        "components, licenses, versions, purls, CVEs, or numbers that are not "
+        "present in the JSON.\n\n"
+        "IMPORTANT: vulnerability_data_present tells you whether this scan run "
+        "actually collected vulnerability data at all (it requires a Dependency "
+        "Track integration or premium API tier). If vulnerability_data_present "
+        "is false, you MUST say vulnerability data was not collected in this "
+        "scan and must NOT imply that zero vulnerabilities were found — those "
+        "are different things. Only report 'no vulnerabilities found' if "
+        "vulnerability_data_present is true and vulnerable_components is empty.\n\n"
         "Write the report in Markdown using EXACTLY this section order and these "
         "headings (omit a section only if the underlying data is completely empty):\n"
         "## Executive Summary\n"
@@ -205,19 +321,31 @@ def call_claude(summary: dict, repo_name: str, repo_ref: str, commit_sha: str) -
         "## License Breakdown\n"
         "## Third-Party Components\n"
         "## Dependencies\n"
+        "## Vulnerabilities\n"
+        "## Snippet Matches\n"
         "## Recommendations\n\n"
         "Section guidance:\n"
         "- Executive Summary: 2-4 sentences, plain language, for a non-specialist reader.\n"
         "- Risk Highlights: a short bulleted callout of anything in "
-        "flagged_copyleft_components or risk_counts.unknown that needs human "
-        "review. If there are zero copyleft/unknown items, say so plainly.\n"
+        "flagged_copyleft_components, vulnerable_components, or risk_counts.unknown "
+        "that needs human review. If there's nothing to flag in a category, say so plainly.\n"
         "- Scan Coverage: the file/match stats as a compact list.\n"
         "- License Breakdown: a Markdown table of license name, count, and risk level.\n"
-        "- Third-Party Components: a Markdown table (component, version, license, risk). "
-        "If components_truncated is true, note that the list was capped and the full "
-        "list is in the raw scan artifact.\n"
-        "- Dependencies: same table style as above for dependency_components, only "
-        "if that list is non-empty.\n"
+        "- Third-Party Components: a Markdown table with columns Component | Version | "
+        "PURL | License(s) | Risk | Vulns, one row per entry in `components`. Use the "
+        "vulnerability_count field for the Vulns column (or '-' if 0). If "
+        "components_truncated is true, note the list was capped and the full list is "
+        "in the raw scan artifact.\n"
+        "- Dependencies: same table style, from `dependency_components`, only if "
+        "that list is non-empty.\n"
+        "- Vulnerabilities: if vulnerability_data_present is false, state plainly "
+        "that vulnerability scanning was not part of this run and how to enable it "
+        "(Dependency Track integration). If true, summarize vulnerability_severity_counts "
+        "and list each entry in vulnerable_components with its CVE id(s) and severity.\n"
+        "- Snippet Matches: a Markdown table (File | Component | Version | Matched % | "
+        "Target Lines | OSS Lines | OSS URL) from `snippet_matches`, which is already "
+        "sorted lowest-match-percentage-first (the ones most worth a human look). If "
+        "snippet_matches_truncated is true, note the total count and that the list was capped.\n"
         "- Recommendations: a short, prioritized bullet list of concrete follow-ups.\n\n"
         f"Length/detail target: {detail_instructions}"
     )
