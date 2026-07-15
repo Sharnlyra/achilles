@@ -12,6 +12,7 @@ Env vars expected:
   REPO_REF             - e.g. "main"                     (optional, for header)
   COMMIT_SHA           - e.g. "abc1234..."                (optional, for header)
   CLAUDE_MODEL         - override model id (default: claude-sonnet-5)
+  REPORT_DETAIL        - "concise" | "standard" | "detailed" (default: standard)
 """
 
 import json
@@ -25,6 +26,46 @@ import requests
 MAX_COMPONENTS_IN_PROMPT = 60
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+
+# Deterministic license risk classification, so the report doesn't rely on
+# the model guessing from a license name string. Names are matched
+# case-insensitively against SPDX-style identifiers/aliases.
+STRONG_COPYLEFT = {
+    "gpl-2.0", "gpl-2.0-only", "gpl-2.0-or-later",
+    "gpl-3.0", "gpl-3.0-only", "gpl-3.0-or-later",
+    "agpl-3.0", "agpl-3.0-only", "agpl-3.0-or-later",
+    "sspl-1.0", "osl-3.0", "eupl-1.2",
+}
+WEAK_COPYLEFT = {
+    "lgpl-2.1", "lgpl-2.1-only", "lgpl-2.1-or-later",
+    "lgpl-3.0", "lgpl-3.0-only", "lgpl-3.0-or-later",
+    "mpl-2.0", "mpl-1.1", "epl-1.0", "epl-2.0", "cddl-1.0", "cddl-1.1",
+}
+PERMISSIVE = {
+    "mit", "apache-2.0", "bsd-2-clause", "bsd-3-clause", "isc",
+    "0bsd", "unlicense", "cc0-1.0", "python-2.0", "zlib",
+}
+
+
+def classify_license(name: str) -> str:
+    if not name:
+        return "unknown"
+    key = name.strip().lower()
+    if key in STRONG_COPYLEFT:
+        return "strong_copyleft"
+    if key in WEAK_COPYLEFT:
+        return "weak_copyleft"
+    if key in PERMISSIVE:
+        return "permissive"
+    return "unknown"
+
+
+def worst_risk(risks: list) -> str:
+    order = ["strong_copyleft", "weak_copyleft", "unknown", "permissive"]
+    for level in order:
+        if level in risks:
+            return level
+    return "unknown"
 
 
 def load_scan_results(path: str) -> dict:
@@ -70,12 +111,14 @@ def summarize(results: dict) -> dict:
 
             key = purls[0] if purls else f"{vendor}/{component_name}@{version}"
             if key and key not in components:
+                risk_levels = [classify_license(n) for n in license_names] or ["unknown"]
                 components[key] = {
                     "purl": purls[0] if purls else None,
                     "vendor": vendor,
                     "component": component_name,
                     "version": version,
                     "licenses": sorted(set(license_names)),
+                    "license_risk": worst_risk(risk_levels),
                 }
 
             # Dependency-scanner entries (when dependencies.enabled: true)
@@ -90,12 +133,27 @@ def summarize(results: dict) -> dict:
                 ]
                 dkey = dep_purl or f"{dep.get('component','')}@{dep_version}"
                 if dkey and dkey not in dependency_components:
+                    dep_risk_levels = [classify_license(n) for n in dep_license_names] or ["unknown"]
                     dependency_components[dkey] = {
                         "purl": dep_purl or None,
                         "component": dep.get("component", ""),
                         "version": dep_version,
                         "licenses": sorted(set(dep_license_names)),
+                        "license_risk": worst_risk(dep_risk_levels),
                     }
+
+    all_items = list(components.values()) + list(dependency_components.values())
+    risk_counts = Counter(item["license_risk"] for item in all_items)
+    flagged_copyleft = [
+        {
+            "component": item["component"] or item.get("purl"),
+            "version": item["version"],
+            "licenses": item["licenses"],
+            "license_risk": item["license_risk"],
+        }
+        for item in all_items
+        if item["license_risk"] in ("strong_copyleft", "weak_copyleft")
+    ]
 
     return {
         "total_files_scanned": total_files,
@@ -104,6 +162,8 @@ def summarize(results: dict) -> dict:
         "unique_components_count": len(components),
         "unique_dependency_components_count": len(dependency_components),
         "license_breakdown": license_counter.most_common(),
+        "risk_counts": dict(risk_counts),
+        "flagged_copyleft_components": flagged_copyleft,
         "components": list(components.values())[:MAX_COMPONENTS_IN_PROMPT],
         "dependency_components": list(dependency_components.values())[
             :MAX_COMPONENTS_IN_PROMPT
@@ -121,17 +181,45 @@ def call_claude(summary: dict, repo_name: str, repo_ref: str, commit_sha: str) -
         sys.exit(1)
 
     model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
+    detail = os.environ.get("REPORT_DETAIL", "standard").strip().lower()
+    detail_instructions = {
+        "concise": "Keep the whole report under ~250 words. Use short bullet points, minimal tables, no filler.",
+        "standard": "Aim for a thorough but skimmable report, roughly 400-700 words plus tables.",
+        "detailed": "Be comprehensive: cover every component group, explain risk reasoning, and don't compress the component table.",
+    }.get(detail, "Aim for a thorough but skimmable report, roughly 400-700 words plus tables.")
 
     system_prompt = (
         "You are a software supply chain security analyst. You will be given a "
-        "condensed, pre-aggregated JSON summary of a SCANOSS SCA/SBOM scan "
-        "(component matches, licenses, dependency data). Write a clear, "
-        "well-structured Markdown SBOM summary report for engineering and "
-        "security stakeholders. Do not invent data that is not present in the "
-        "JSON. Include: an executive summary, scan coverage stats, a license "
-        "breakdown with any notable copyleft or unusual licenses flagged, a "
-        "table of key third-party components, and a short list of "
-        "recommendations or follow-up items. Keep it concise and skimmable."
+        "condensed, pre-aggregated JSON summary of a SCANOSS SCA/SBOM scan. "
+        "The JSON already contains a deterministic license risk classification "
+        "per component (license_risk: strong_copyleft | weak_copyleft | permissive | "
+        "unknown) and a pre-filtered list of copyleft-flagged components "
+        "(flagged_copyleft_components). Do NOT reclassify or second-guess these "
+        "risk labels yourself, and do not invent components, licenses, or "
+        "numbers that are not present in the JSON.\n\n"
+        "Write the report in Markdown using EXACTLY this section order and these "
+        "headings (omit a section only if the underlying data is completely empty):\n"
+        "## Executive Summary\n"
+        "## Risk Highlights\n"
+        "## Scan Coverage\n"
+        "## License Breakdown\n"
+        "## Third-Party Components\n"
+        "## Dependencies\n"
+        "## Recommendations\n\n"
+        "Section guidance:\n"
+        "- Executive Summary: 2-4 sentences, plain language, for a non-specialist reader.\n"
+        "- Risk Highlights: a short bulleted callout of anything in "
+        "flagged_copyleft_components or risk_counts.unknown that needs human "
+        "review. If there are zero copyleft/unknown items, say so plainly.\n"
+        "- Scan Coverage: the file/match stats as a compact list.\n"
+        "- License Breakdown: a Markdown table of license name, count, and risk level.\n"
+        "- Third-Party Components: a Markdown table (component, version, license, risk). "
+        "If components_truncated is true, note that the list was capped and the full "
+        "list is in the raw scan artifact.\n"
+        "- Dependencies: same table style as above for dependency_components, only "
+        "if that list is non-empty.\n"
+        "- Recommendations: a short, prioritized bullet list of concrete follow-ups.\n\n"
+        f"Length/detail target: {detail_instructions}"
     )
 
     user_content = (
@@ -141,9 +229,11 @@ def call_claude(summary: dict, repo_name: str, repo_ref: str, commit_sha: str) -
         f"Scan summary JSON:\n```json\n{json.dumps(summary, indent=2)}\n```"
     )
 
+    max_tokens = {"concise": 1200, "standard": 3000, "detailed": 5000}.get(detail, 3000)
+
     payload = {
         "model": model,
-        "max_tokens": 3000,
+        "max_tokens": max_tokens,
         "system": system_prompt,
         "messages": [{"role": "user", "content": user_content}],
     }
