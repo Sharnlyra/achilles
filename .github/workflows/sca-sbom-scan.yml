@@ -1,71 +1,37 @@
-name: SCA Scan + AI SBOM Summary (Central)
+name: SCA Scan + AI SBOM Summary
 
-# This workflow lives in a central/hub repo. It does NOT scan itself - it
-# scans whichever repo it's told to scan, either via:
-#   1. repository_dispatch, sent by a small trigger workflow living in the
-#      target repo (fires automatically on every push there), or
-#   2. workflow_dispatch, for manual/on-demand runs.
 on:
-  repository_dispatch:
-    types: [sca-scan-request]
-  workflow_dispatch:
-    inputs:
-      target_repo:
-        description: 'Repo to scan, e.g. my-org/my-app'
-        required: true
-      target_ref:
-        description: 'Branch, tag, or SHA to scan'
-        required: false
-        default: 'main'
+  pull_request:
+  push:
+    branches:
+      - '*'
 
 permissions:
   contents: read
+  pull-requests: write
+  checks: write
+  actions: read
 
 jobs:
-  resolve-target:
-    name: Resolve target repo/ref
-    runs-on: ubuntu-latest
-    outputs:
-      repo: ${{ steps.set.outputs.repo }}
-      ref: ${{ steps.set.outputs.ref }}
-    steps:
-      - id: set
-        run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "repo=${{ github.event.client_payload.repository }}" >> "$GITHUB_OUTPUT"
-            echo "ref=${{ github.event.client_payload.ref }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "repo=${{ inputs.target_repo }}" >> "$GITHUB_OUTPUT"
-            echo "ref=${{ inputs.target_ref }}" >> "$GITHUB_OUTPUT"
-          fi
-
   scanoss-code-scan:
     name: SCANOSS Code Scan
-    needs: resolve-target
     runs-on: ubuntu-latest
 
     outputs:
       result-filepath: ${{ steps.scanoss-code-scan-step.outputs.result-filepath }}
       stdout-scan-command: ${{ steps.scanoss-code-scan-step.outputs.stdout-scan-command }}
-      resolved-sha: ${{ steps.resolved-sha.outputs.sha }}
 
     steps:
-      - name: Checkout target repository
+      - name: Checkout code
         uses: actions/checkout@v6
-        with:
-          repository: ${{ needs.resolve-target.outputs.repo }}
-          ref: ${{ needs.resolve-target.outputs.ref }}
-          token: ${{ secrets.TARGET_REPO_TOKEN }}   # PAT with at least read access to the target repo
-
-      - name: Capture resolved commit SHA
-        id: resolved-sha
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Run SCANOSS Code Scan
         id: scanoss-code-scan-step
         uses: scanoss/gha-code-scan@v1
         with:
           dependencies.enabled: true
+          policies: copyleft, undeclared
+          policies.halt_on_failure: false   # report license/copyleft issues without blocking the build
 
       - name: Save scan command output to file
         env:
@@ -83,13 +49,13 @@ jobs:
 
   ai-sbom-summary:
     name: Generate AI SBOM Summary
-    needs: [resolve-target, scanoss-code-scan]
+    needs: scanoss-code-scan
     runs-on: ubuntu-latest
     permissions:
       contents: read
 
     steps:
-      - name: Checkout central repo (for the generator script)
+      - name: Checkout code (for the generator script)
         uses: actions/checkout@v6
 
       - name: Download raw SCANOSS results
@@ -110,9 +76,9 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SCANOSS_RESULT_FILE: scan-results/${{ needs.scanoss-code-scan.outputs.result-filepath }}
-          REPO_NAME: ${{ needs.resolve-target.outputs.repo }}
-          REPO_REF: ${{ needs.resolve-target.outputs.ref }}
-          COMMIT_SHA: ${{ needs.scanoss-code-scan.outputs.resolved-sha }}
+          REPO_NAME: ${{ github.repository }}
+          REPO_REF: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
           REPORT_DETAIL: ${{ vars.REPORT_DETAIL || 'standard' }}   # concise | standard | detailed
         run: python scripts/generate_sbom_summary.py
 
@@ -135,10 +101,9 @@ jobs:
       - name: Copy reports into reports repository
         run: |
           set -euo pipefail
-          REPO_SLUG=$(echo "${{ needs.resolve-target.outputs.repo }}" | tr '/' '__')
-          DEST_DIR="reports-repo/reports/${REPO_SLUG}"
+          DEST_DIR="reports-repo/reports/${{ github.event.repository.name }}"
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
-          SHORT_SHA=$(echo "${{ needs.scanoss-code-scan.outputs.resolved-sha }}" | cut -c1-7)
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
           RUN_DIR="${DEST_DIR}/${TIMESTAMP}-${SHORT_SHA}"
           mkdir -p "$RUN_DIR"
 
@@ -151,7 +116,7 @@ jobs:
           cp "$RAW_RESULT_FILE" "${RUN_DIR}/scanoss-raw.json"
           cp scan-results/scanoss-stdout.txt "${RUN_DIR}/scanoss-stdout.txt"
 
-          # Stable "latest" pointers at the component's top level
+          # Stable "latest" pointers at the repo's top level
           cp sbom-summary-report.md   "${DEST_DIR}/latest.md"
           cp sbom-summary-report.html "${DEST_DIR}/latest.html"
           cp "$RAW_RESULT_FILE"       "${DEST_DIR}/latest-raw.json"
@@ -168,5 +133,5 @@ jobs:
             echo "No changes to commit."
             exit 0
           fi
-          git commit -m "docs(sbom): add SBOM summary for ${{ needs.resolve-target.outputs.repo }}@${{ needs.scanoss-code-scan.outputs.resolved-sha }}"
+          git commit -m "docs(sbom): add SBOM summary for ${{ github.repository }}@${{ github.sha }}"
           git push
