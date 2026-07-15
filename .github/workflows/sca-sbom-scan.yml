@@ -1,0 +1,121 @@
+name: SCA Scan + AI SBOM Summary
+
+on:
+  pull_request:
+  push:
+    branches:
+      - '*'
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+  actions: read
+
+jobs:
+  scanoss-code-scan:
+    name: SCANOSS Code Scan
+    runs-on: ubuntu-latest
+
+    outputs:
+      result-filepath: ${{ steps.scanoss-code-scan-step.outputs.result-filepath }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Run SCANOSS Code Scan
+        id: scanoss-code-scan-step
+        uses: scanoss/gha-code-scan@v1
+        with:
+          dependencies.enabled: true
+          # policies: copyleft, undeclared   # uncomment to enforce policy gates
+          # policies.halt_on_failure: false
+
+      - name: Print stdout scan command
+        run: echo "${{ steps.scanoss-code-scan-step.outputs.stdout-scan-command }}"
+
+      - name: Upload raw SCANOSS results
+        uses: actions/upload-artifact@v4
+        with:
+          name: scanoss-raw-results
+          path: ${{ steps.scanoss-code-scan-step.outputs.result-filepath }}
+          retention-days: 14
+
+  ai-sbom-summary:
+    name: Generate AI SBOM Summary
+    needs: scanoss-code-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code (for repo metadata)
+        uses: actions/checkout@v6
+
+      - name: Download raw SCANOSS results
+        uses: actions/download-artifact@v4
+        with:
+          name: scanoss-raw-results
+          path: scan-results
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir requests
+
+      - name: Generate SBOM summary report with Claude
+        id: generate-summary
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SCANOSS_RESULT_FILE: scan-results/${{ needs.scanoss-code-scan.outputs.result-filepath }}
+          REPO_NAME: ${{ github.repository }}
+          REPO_REF: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: python scripts/generate_sbom_summary.py
+
+      - name: Upload AI SBOM summary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-sbom-summary
+          path: sbom-summary-report.md
+          retention-days: 90
+
+      - name: Checkout reports repository
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ vars.REPORTS_REPO }}       # e.g. "my-org/sbom-reports"
+          token: ${{ secrets.REPORTS_REPO_TOKEN }}    # PAT / fine-grained token with contents:write on that repo
+          path: reports-repo
+
+      - name: Copy report into reports repository
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          DEST_DIR="reports-repo/reports/${REPO_NAME}"
+          mkdir -p "$DEST_DIR"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          DEST_FILE="${DEST_DIR}/${TIMESTAMP}-${SHORT_SHA}.md"
+          cp sbom-summary-report.md "$DEST_FILE"
+          # Keep a stable "latest" pointer too
+          cp sbom-summary-report.md "${DEST_DIR}/latest.md"
+          echo "DEST_FILE=$DEST_FILE" >> "$GITHUB_ENV"
+
+      - name: Commit and push report
+        working-directory: reports-repo
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "docs(sbom): add SBOM summary for ${{ github.repository }}@${{ github.sha }}"
+          git push
