@@ -75,6 +75,7 @@ jobs:
           REPO_NAME: ${{ github.repository }}
           REPO_REF: ${{ github.ref_name }}
           COMMIT_SHA: ${{ github.sha }}
+          REPORT_DETAIL: ${{ vars.REPORT_DETAIL || 'standard' }}   # concise | standard | detailed
         run: python scripts/generate_sbom_summary.py
 
       - name: Upload AI SBOM summary artifact
