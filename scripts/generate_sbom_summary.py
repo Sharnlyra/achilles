@@ -21,12 +21,52 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 
+import markdown as md_lib
 import requests
 
 MAX_COMPONENTS_IN_PROMPT = 60
 MAX_SNIPPETS_IN_PROMPT = 40
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SBOM Summary Report - {repo_name}</title>
+<style>
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 960px;
+    margin: 2rem auto;
+    padding: 0 1.5rem;
+    color: #1a1a1a;
+    line-height: 1.55;
+  }}
+  h1 {{ border-bottom: 3px solid #2563eb; padding-bottom: 0.4rem; }}
+  h2 {{ margin-top: 2.2rem; border-bottom: 1px solid #d1d5db; padding-bottom: 0.3rem; color: #1e3a8a; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.92rem; }}
+  th, td {{ border: 1px solid #d1d5db; padding: 0.45rem 0.6rem; text-align: left; vertical-align: top; }}
+  th {{ background: #f3f4f6; }}
+  tr:nth-child(even) {{ background: #fafafa; }}
+  code {{ background: #f3f4f6; padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.9em; }}
+  .meta {{ color: #4b5563; font-size: 0.9rem; margin-bottom: 1.5rem; }}
+  .meta strong {{ color: #111827; }}
+  ul {{ margin: 0.4rem 0; }}
+</style>
+</head>
+<body>
+{body}
+</body>
+</html>
+"""
+
+
+def render_html(markdown_text: str, repo_name: str) -> str:
+    body_html = md_lib.markdown(
+        markdown_text, extensions=["tables", "fenced_code", "sane_lists"]
+    )
+    return HTML_TEMPLATE.format(repo_name=repo_name, body=body_html)
 
 # Deterministic license risk classification, so the report doesn't rely on
 # the model guessing from a license name string. Names are matched
@@ -413,7 +453,10 @@ def main() -> None:
     with open("sbom-summary-report.md", "w", encoding="utf-8") as f:
         f.write(header + report_body + "\n")
 
-    print("Wrote sbom-summary-report.md")
+    with open("sbom-summary-report.html", "w", encoding="utf-8") as f:
+        f.write(render_html(header + report_body, repo_name))
+
+    print("Wrote sbom-summary-report.md and sbom-summary-report.html")
 
 
 if __name__ == "__main__":
