@@ -15,7 +15,7 @@ permissions:
 jobs:
   scanoss-code-scan:
     name: SCANOSS Code Scan
-    runs-on: ubuntu-latest
+    runs-on: self-hosted   # runs on your WSL machine, alongside Dependency-Track
 
     outputs:
       result-filepath: ${{ steps.scanoss-code-scan-step.outputs.result-filepath }}
@@ -30,8 +30,13 @@ jobs:
         uses: scanoss/gha-code-scan@v1
         with:
           dependencies.enabled: true
-          policies: copyleft, undeclared
-          policies.halt_on_failure: false   # report license/copyleft issues without blocking the build
+          policies: copyleft, undeclared, dt
+          policies.halt_on_failure: false   # report license/copyleft/DT issues without blocking the build
+          deptrack.upload: true
+          deptrack.url: ${{ vars.DT_URL }}
+          deptrack.apikey: ${{ secrets.DT_API_KEY }}
+          deptrack.projectname: ${{ github.event.repository.name }}
+          deptrack.projectversion: ${{ github.ref_name }}
 
       - name: Save scan command output to file
         env:
@@ -47,9 +52,62 @@ jobs:
             scanoss-stdout.txt
           retention-days: 14
 
+  scanoss-crypto-scan:
+    name: SCANOSS Crypto Finder Scan
+    runs-on: self-hosted   # runs on your WSL machine, alongside Dependency-Track
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Run Crypto Finder scan (interim JSON)
+        env:
+          SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}
+        run: |
+          mkdir -p crypto-results
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            -e SCANOSS_API_KEY \
+            ghcr.io/scanoss/crypto-finder:latest \
+            scan --output /workspace/crypto-results/crypto-findings.json /workspace
+
+      - name: Convert findings to CycloneDX CBOM
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace \
+            ghcr.io/scanoss/crypto-finder:latest \
+            convert /workspace/crypto-results/crypto-findings.json \
+            --output /workspace/crypto-results/crypto-cbom.json
+
+      - name: Upload raw Crypto Finder results
+        uses: actions/upload-artifact@v4
+        with:
+          name: crypto-finder-raw-results
+          path: |
+            crypto-results/crypto-findings.json
+            crypto-results/crypto-cbom.json
+          retention-days: 14
+
+      - name: Upload crypto CBOM to Dependency-Track
+        env:
+          DT_URL: ${{ vars.DT_URL }}
+          DT_API_KEY: ${{ secrets.DT_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DT_URL:-}" ]; then
+            echo "DT_URL not set, skipping Dependency-Track crypto CBOM upload."
+            exit 0
+          fi
+          curl -sS -X POST "${DT_URL}/api/v1/bom" \
+            -H "X-Api-Key: ${DT_API_KEY}" \
+            -F "autoCreate=true" \
+            -F "projectName=${{ github.event.repository.name }}" \
+            -F "projectVersion=${{ github.ref_name }}" \
+            -F "bom=@crypto-results/crypto-cbom.json"
+
   ai-sbom-summary:
     name: Generate AI SBOM Summary
-    needs: scanoss-code-scan
+    needs: [scanoss-code-scan, scanoss-crypto-scan]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -64,6 +122,12 @@ jobs:
           name: scanoss-raw-results
           path: scan-results
 
+      - name: Download raw Crypto Finder results
+        uses: actions/download-artifact@v4
+        with:
+          name: crypto-finder-raw-results
+          path: crypto-results
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -76,6 +140,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SCANOSS_RESULT_FILE: scan-results/${{ needs.scanoss-code-scan.outputs.result-filepath }}
+          CRYPTO_RESULT_FILE: crypto-results/crypto-findings.json
           REPO_NAME: ${{ github.repository }}
           REPO_REF: ${{ github.ref_name }}
           COMMIT_SHA: ${{ github.sha }}
@@ -116,11 +181,17 @@ jobs:
           cp "$RAW_RESULT_FILE" "${RUN_DIR}/scanoss-raw.json"
           cp scan-results/scanoss-stdout.txt "${RUN_DIR}/scanoss-stdout.txt"
 
+          # Raw Crypto Finder artifacts, unmodified
+          cp crypto-results/crypto-findings.json "${RUN_DIR}/crypto-findings.json"
+          cp crypto-results/crypto-cbom.json     "${RUN_DIR}/crypto-cbom.json"
+
           # Stable "latest" pointers at the repo's top level
           cp sbom-summary-report.md   "${DEST_DIR}/latest.md"
           cp sbom-summary-report.html "${DEST_DIR}/latest.html"
           cp "$RAW_RESULT_FILE"       "${DEST_DIR}/latest-raw.json"
           cp scan-results/scanoss-stdout.txt "${DEST_DIR}/latest-stdout.txt"
+          cp crypto-results/crypto-findings.json "${DEST_DIR}/latest-crypto-findings.json"
+          cp crypto-results/crypto-cbom.json     "${DEST_DIR}/latest-crypto-cbom.json"
 
       - name: Commit and push reports
         working-directory: reports-repo
