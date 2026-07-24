@@ -1,158 +1,52 @@
-name: SCA Scan + AI SBOM Summary
+name: SCANOSS → Dependency-Track
 
 on:
-  pull_request:
   push:
     branches:
       - '*'
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
-  pull-requests: write
-  checks: write
-  actions: read
 
 jobs:
-  scanoss-code-scan:
-    name: SCANOSS Code Scan
+  scan-and-upload:
     runs-on: self-hosted
-
-    outputs:
-      result-filepath: ${{ steps.scanoss.outputs.result-filepath }}
-      stdout-scan-command: ${{ steps.scanoss.outputs.stdout-scan-command }}
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Verify Docker
+      - name: Verify Dependency-Track
         run: |
-          docker --version
-          docker run --rm curlimages/curl ${{ secrets.DT_URL }}/api/version
+          docker run --rm curlimages/curl \
+            ${{ secrets.DT_URL }}/api/version
 
-      - name: Run SCANOSS Code Scan
+      - name: Run SCANOSS Scan
         id: scanoss
         uses: scanoss/gha-code-scan@v1
         with:
           dependencies.enabled: true
-
-          policies: copyleft,undeclared,dt
+          policies: copyleft,undeclared
           policies.halt_on_failure: false
 
-          deptrack.upload: true
-          deptrack.url: ${{ secrets.DT_URL }}
-          deptrack.apikey: ${{ secrets.DT_API_KEY }}
-
-          # Existing project in Dependency-Track
-          deptrack.projectname: Lyra
-          deptrack.projectversion: "1.0"
-
-      - name: Save SCANOSS stdout
-        env:
-          STDOUT_CONTENT: ${{ steps.scanoss.outputs.stdout-scan-command }}
+      - name: Verify CycloneDX SBOM
         run: |
-          printf '%s\n' "$STDOUT_CONTENT" > scanoss-stdout.txt
+          echo "Searching for CycloneDX SBOM..."
+          find . -type f \( -name "*.json" -o -name "*.cdx.json" -o -name "bom*" \)
 
-      - name: Upload raw scan artifacts
+      - name: Upload CycloneDX SBOM to Dependency-Track
+        run: |
+          curl -X POST "${{ secrets.DT_URL }}/api/v1/bom" \
+            -H "X-Api-Key: ${{ secrets.DT_API_KEY }}" \
+            -F "projectName=Lyra" \
+            -F "projectVersion=1.0" \
+            -F "autoCreate=true" \
+            -F "bom=@bom.json"
+
+      - name: Upload SBOM Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: scanoss-raw-results
-          retention-days: 14
-          path: |
-            ${{ steps.scanoss.outputs.result-filepath }}
-            scanoss-stdout.txt
-
-  ai-sbom-summary:
-    name: Generate AI SBOM Summary
-    needs: scanoss-code-scan
-    runs-on: ubuntu-latest
-
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download SCANOSS results
-        uses: actions/download-artifact@v4
-        with:
-          name: scanoss-raw-results
-          path: scan-results
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install Python packages
-        run: |
-          pip install requests markdown
-
-      - name: Generate AI SBOM Summary
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SCANOSS_RESULT_FILE: scan-results/${{ needs.scanoss-code-scan.outputs.result-filepath }}
-          REPO_NAME: ${{ github.repository }}
-          REPO_REF: ${{ github.ref_name }}
-          COMMIT_SHA: ${{ github.sha }}
-          REPORT_DETAIL: ${{ vars.REPORT_DETAIL || 'standard' }}
-        run: |
-          python scripts/generate_sbom_summary.py
-
-      - name: Upload AI report
-        uses: actions/upload-artifact@v4
-        with:
-          name: ai-sbom-summary
-          retention-days: 90
-          path: |
-            sbom-summary-report.md
-            sbom-summary-report.html
-
-      - name: Checkout Reports Repository
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ vars.REPORTS_REPO }}
-          token: ${{ secrets.REPORTS_REPO_TOKEN }}
-          path: reports-repo
-
-      - name: Copy reports
-        run: |
-          set -e
-
-          DEST="reports-repo/reports/${{ github.event.repository.name }}"
-          TS=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
-          SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-
-          RUN_DIR="$DEST/$TS-$SHA"
-
-          mkdir -p "$RUN_DIR"
-
-          cp sbom-summary-report.md "$RUN_DIR/report.md"
-          cp sbom-summary-report.html "$RUN_DIR/report.html"
-
-          RAW="scan-results/${{ needs.scanoss-code-scan.outputs.result-filepath }}"
-
-          cp "$RAW" "$RUN_DIR/scanoss-raw.json"
-          cp scan-results/scanoss-stdout.txt "$RUN_DIR/scanoss-stdout.txt"
-
-          cp sbom-summary-report.md "$DEST/latest.md"
-          cp sbom-summary-report.html "$DEST/latest.html"
-          cp "$RAW" "$DEST/latest-raw.json"
-          cp scan-results/scanoss-stdout.txt "$DEST/latest-stdout.txt"
-
-      - name: Commit reports
-        working-directory: reports-repo
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add .
-
-          if git diff --cached --quiet; then
-            echo "Nothing to commit."
-            exit 0
-          fi
-
-          git commit -m "docs(sbom): add report for ${{ github.repository }}@${{ github.sha }}"
-          git push
+          name: cyclonedx-sbom
+          path: bom.json
