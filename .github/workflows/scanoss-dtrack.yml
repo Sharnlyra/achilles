@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  sbom-scan:
+  scanoss:
     runs-on: self-hosted
 
     env:
@@ -22,32 +22,65 @@ jobs:
       PROJECT_VERSION: "1.0"
 
     steps:
+      ###########################################################
+      # Checkout
+      ###########################################################
+
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      ###########################################################
+      # Python
+      ###########################################################
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      ###########################################################
+      # Install CLI
+      ###########################################################
+
       - name: Install SCANOSS CLI
         run: |
           python -m pip install --upgrade pip
           python -m pip install scanoss
 
-      - name: Verify Installation
+      ###########################################################
+      # Verify installation
+      ###########################################################
+
+      - name: Verify CLI
         run: |
+          echo "===== Python ====="
           python --version
+
+          echo ""
+          echo "===== Pip ====="
           pip --version
+
+          echo ""
+          echo "===== Executable ====="
           which scanoss-py || true
+
+          echo ""
+          echo "===== Version ====="
           scanoss-py --version || true
+
+          echo ""
+          echo "===== Help ====="
           scanoss-py --help || true
 
-      ##############################################################
-      # Configure SCANOSS
-      ##############################################################
+          echo ""
+          echo "===== Scan Help ====="
+          scanoss-py scan --help || true
 
-      - name: Configure API Key
+      ###########################################################
+      # Configure API
+      ###########################################################
+
+      - name: Configure SCANOSS
         run: |
           mkdir -p ~/.config/scanoss
 
@@ -57,46 +90,146 @@ jobs:
           }
           EOF
 
-          echo "Configuration created."
+          echo "Configuration written."
 
-      ##############################################################
-      # Generate CycloneDX SBOM
-      ##############################################################
+      ###########################################################
+      # Generate SBOM
+      ###########################################################
 
       - name: Generate SBOM
         run: |
           mkdir -p output
 
-          # Replace this command if your installed version differs
+          # Adjust this command if your CLI syntax differs
           scanoss-py scan . \
             --format cyclonedx \
             --output output/bom.json
 
-      - name: Verify SBOM
-        run: |
-          ls -lh output
-          test -f output/bom.json
+      ###########################################################
+      # Inspect SBOM
+      ###########################################################
 
-      ##############################################################
-      # Upload to Dependency-Track
-      ##############################################################
-
-      - name: Upload BOM
+      - name: Inspect SBOM
         run: |
-          curl -X POST \
+
+          echo "=================================="
+          echo "Generated Files"
+          echo "=================================="
+
+          ls -lah output
+
+          if [ ! -f output/bom.json ]; then
+            echo "SBOM not generated."
+            exit 1
+          fi
+
+          echo ""
+          echo "=================================="
+          echo "First 50 Lines"
+          echo "=================================="
+
+          head -50 output/bom.json
+
+          echo ""
+          echo "=================================="
+          echo "Validate JSON"
+          echo "=================================="
+
+          python3 - <<'EOF'
+          import json
+
+          with open("output/bom.json") as f:
+              data=json.load(f)
+
+          print("Top Level Keys")
+          print("--------------------")
+          print(list(data.keys()))
+          print()
+
+          print("bomFormat:",data.get("bomFormat"))
+          print("specVersion:",data.get("specVersion"))
+          print("serialNumber:",data.get("serialNumber"))
+          print("version:",data.get("version"))
+
+          if "components" in data:
+              print()
+              print("Components:",len(data["components"]))
+          else:
+              print()
+              print("No components section found")
+          EOF
+
+      ###########################################################
+      # Upload BOM
+      ###########################################################
+
+      - name: Upload BOM to Dependency-Track
+        run: |
+
+          echo "Uploading..."
+
+          HTTP_CODE=$(curl \
+            --verbose \
+            --location \
+            --write-out "%{http_code}" \
+            --output response.json \
+            --request POST \
             "${DT_URL}/api/v1/bom" \
-            -H "X-Api-Key: ${DT_API_KEY}" \
-            -F "autoCreate=true" \
-            -F "projectName=${PROJECT_NAME}" \
-            -F "projectVersion=${PROJECT_VERSION}" \
-            -F "bom=@output/bom.json"
+            --header "X-Api-Key: ${DT_API_KEY}" \
+            --form "autoCreate=true" \
+            --form "projectName=${PROJECT_NAME}" \
+            --form "projectVersion=${PROJECT_VERSION}" \
+            --form "bom=@output/bom.json")
 
-      ##############################################################
+          echo ""
+          echo "=================================="
+          echo "HTTP STATUS"
+          echo "=================================="
+
+          echo "${HTTP_CODE}"
+
+          echo ""
+          echo "=================================="
+          echo "Dependency-Track Response"
+          echo "=================================="
+
+          cat response.json || true
+
+          if [ "${HTTP_CODE}" != "200" ] && [ "${HTTP_CODE}" != "201" ]; then
+            echo "Dependency-Track upload failed."
+            exit 1
+          fi
+
+      ###########################################################
+      # Wait
+      ###########################################################
+
+      - name: Wait for Processing
+        run: |
+          echo "Waiting for Dependency-Track processing..."
+          sleep 20
+
+      ###########################################################
+      # Verify Project
+      ###########################################################
+
+      - name: Verify Project
+        run: |
+
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+          curl \
+            --silent \
+            --header "X-Api-Key: ${DT_API_KEY}" \
+            "${DT_URL}/api/v1/project" | jq .
+
+      ###########################################################
       # Upload Artifact
-      ##############################################################
+      ###########################################################
 
       - name: Upload SBOM
         uses: actions/upload-artifact@v4
         with:
-          name: cyclonedx-sbom
+          name: scanoss-cyclonedx
           path: output/bom.json
