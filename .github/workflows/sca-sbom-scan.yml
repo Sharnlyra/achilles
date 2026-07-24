@@ -1,52 +1,72 @@
-name: SCANOSS → Dependency-Track
+name: SCANOSS SBOM to Dependency-Track
 
 on:
   push:
     branches:
-      - '*'
-  pull_request:
+      - main
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  scan-and-upload:
+  scanoss:
     runs-on: self-hosted
 
+    env:
+      SCANOSS_API_KEY: ${{ secrets.SCANOSS_API_KEY }}
+      DT_URL: ${{ secrets.DT_URL }}
+      DT_API_KEY: ${{ secrets.DT_API_KEY }}
+      PROJECT_NAME: Lyra
+      PROJECT_VERSION: "1.0"
+
     steps:
-      - name: Checkout source
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Verify Dependency-Track
-        run: |
-          docker run --rm curlimages/curl \
-            ${{ secrets.DT_URL }}/api/version
-
-      - name: Run SCANOSS Scan
-        id: scanoss
-        uses: scanoss/gha-code-scan@v1
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          dependencies.enabled: true
-          policies: copyleft,undeclared
-          policies.halt_on_failure: false
+          python-version: "3.12"
 
-      - name: Verify CycloneDX SBOM
+      - name: Install SCANOSS CLI
         run: |
-          echo "Searching for CycloneDX SBOM..."
-          find . -type f \( -name "*.json" -o -name "*.cdx.json" -o -name "bom*" \)
+          python -m pip install --upgrade pip
+          pip install scanoss-py
 
-      - name: Upload CycloneDX SBOM to Dependency-Track
+      - name: Verify Installation
         run: |
-          curl -X POST "${{ secrets.DT_URL }}/api/v1/bom" \
-            -H "X-Api-Key: ${{ secrets.DT_API_KEY }}" \
-            -F "projectName=Lyra" \
-            -F "projectVersion=1.0" \
+          scanoss-py --version
+
+      - name: Configure SCANOSS API Key
+        run: |
+          mkdir -p ~/.config/scanoss
+          cat > ~/.config/scanoss/config.json <<EOF
+          {
+            "api_key": "${SCANOSS_API_KEY}"
+          }
+          EOF
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          scanoss-py scan \
+            . \
+            --format cyclonedx \
+            --output sbom.json
+
+      - name: Verify SBOM
+        run: |
+          ls -lh sbom.json
+          head -20 sbom.json
+
+      - name: Upload SBOM to Dependency-Track
+        run: |
+          curl -X POST "${DT_URL}/api/v1/bom" \
+            -H "X-Api-Key: ${DT_API_KEY}" \
             -F "autoCreate=true" \
-            -F "bom=@bom.json"
+            -F "projectName=${PROJECT_NAME}" \
+            -F "projectVersion=${PROJECT_VERSION}" \
+            -F "bom=@sbom.json"
 
-      - name: Upload SBOM Artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: cyclonedx-sbom
-          path: bom.json
+          path: sbom.json
